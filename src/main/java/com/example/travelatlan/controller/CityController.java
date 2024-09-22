@@ -1,33 +1,22 @@
 package com.example.travelatlan.controller;
 
-import com.example.travelatlan.models.City;
-import com.example.travelatlan.repository.CityRepository;
-import com.example.travelatlan.service.CityService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
 
-import org.neo4j.driver.Driver;
-import org.neo4j.driver.Result;
-import org.neo4j.driver.internal.util.Iterables;
-import org.neo4j.driver.types.Node;
-import org.neo4j.driver.types.Relationship;
+import org.neo4j.driver.*;
+
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
+import java.util.stream.Collectors;
 
 @RestController
 public class CityController {
-
-  @Autowired
-  private CityService cityService;
 
   @Autowired
   Driver driver;
@@ -35,145 +24,225 @@ public class CityController {
   @Autowired
   ObjectMapper objectMapper;
 
-  @Autowired
-  CityRepository cityRepository;
-
-  @GetMapping("/addCity")
-  public City addCity(@RequestParam String name, @RequestParam List<String> interests) {
-    return cityService.addCity(name, interests);
-  }
-
-  @GetMapping("/findAllInterests")
+  @GetMapping("/v1/findAllInterests")
   public List<String> findAllInterests() {
-    return cityRepository.findAllUniqueInterests();
-  }
+    String cypherQuery = """
+            MATCH (activity:Activity)
+            WITH collect(DISTINCT activity.type) AS activityTypes
+            
+            MATCH (restaurant:Restaurant)
+            WITH activityTypes, collect(DISTINCT restaurant.cuisine) AS restaurantCuisines
 
-  @GetMapping("/find")
-  public Map<String,Object> findShortest(@RequestParam String startCity, String endCity, int maxBudget, int maxDuration) {
-    try (var session = driver.session()) {
-      System.out.println(startCity + endCity + maxBudget + maxDuration);
-      String cypherQuery = "MATCH p = (start:City {name: '" + startCity + "'})-[:CONNECTS*]->(end:City {name: '" + endCity + "'}) "
-              + "WHERE ALL(rel in relationships(p) WHERE rel.cost <= 5000 AND rel.travelTime <= 5) "
-              + "WITH p, reduce(totalCost = 0, rel in relationships(p) | totalCost + rel.cost) AS totalCost, "
-              + "reduce(totalTime = 0, rel in relationships(p) | totalTime + rel.travelTime) AS totalTime "
-              + "WHERE totalCost <= " + maxBudget + " AND totalTime <= " + maxDuration + " "
-              + "RETURN p, totalCost, totalTime "
-              + "ORDER BY totalCost ASC, totalTime ASC "
-              + "LIMIT 10;";
+            WITH activityTypes + restaurantCuisines AS interestTypes
 
+            MATCH (accommodation:Accommodation)
+            WITH interestTypes, collect(DISTINCT accommodation.type) AS accommodationTypes
+
+            WITH interestTypes + accommodationTypes AS interestTypes
+
+            MATCH (attraction:Attraction)
+            WITH interestTypes, collect(DISTINCT attraction.name) AS attractionNames
+
+            WITH interestTypes + attractionNames AS allInterests
+
+            RETURN allInterests AS userInterests
+        """;
+
+    try (Session session = driver.session()) {
       Result result = session.run(cypherQuery);
-      ArrayNode pathsArray = objectMapper.createArrayNode();
-      List<String> cities = new ArrayList<>();
-
-      while (result.hasNext()) {
-        var record = result.next();
-        var path = record.get("p").asPath();
-        var totalCost = record.get("totalCost").asInt();
-        var totalTime = record.get("totalTime").asDouble();
-
-        ObjectNode pathObject = objectMapper.createObjectNode();
-        ArrayNode nodesArray = objectMapper.createArrayNode();
-        ArrayNode edgesArray = objectMapper.createArrayNode();
-
-        List<Node> nodeList = Iterables.asList(path.nodes());
-        List<Relationship> relationshipList = Iterables.asList(path.relationships());
-
-        for (int i = 0; i < nodeList.size(); i++) {
-          var node = nodeList.get(i);
-          var nodeName = node.get("name").asString();
-
-          cities.add(nodeName);
-
-          ObjectNode nodeObject = objectMapper.createObjectNode();
-          nodeObject.put("name", nodeName);
-          nodesArray.add(nodeObject);
-
-          if (i < nodeList.size() - 1) {
-            var rel = relationshipList.get(i);
-            ObjectNode edgeObject = objectMapper.createObjectNode();
-            edgeObject.put("cost", rel.get("cost").asInt());
-            edgeObject.put("travelTime", rel.get("travelTime").asDouble());
-            edgesArray.add(edgeObject);
-          }
-        }
-
-        pathObject.put("nodes", nodesArray);
-        pathObject.put("edges", edgesArray);
-        pathObject.put("totalCost", totalCost);
-        pathObject.put("totalTime", totalTime);
-
-        pathsArray.add(pathObject);
-      }
-
-      ObjectNode responseObject = objectMapper.createObjectNode();
-      responseObject.set("paths", pathsArray);
-      String res = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(responseObject);
-
-      Map<String,Object> response = new HashMap<>();
-      response.put("interests",populate(cities));
-      response.put("paths",pathsArray);
-
-      return response;
-
+      return result.single()
+              .get("userInterests")
+              .asList()
+              .stream()
+              .map(Object::toString)
+              .collect(Collectors.toList());
     } catch (Exception e) {
-      e.printStackTrace();
-      Map<String,Object> response = new HashMap<>();
-      response.put("message","{\"error\":\"Error occurred: " + e.getMessage() + "\"}");
-      return response;
+      System.err.println("Error executing query: " + e.getMessage());
+      throw new RuntimeException("Failed to retrieve interests", e);
     }
   }
 
-  @GetMapping("/init")
-  public void seedData() throws Exception {
-    try (var session = driver.session()) {
+  @GetMapping("/v1/findOptimalTripsWithStartCity")
+  public List<Map<String, Object>> findOptimalTrips(
+          @RequestParam("userMaxBudget") double userMaxBudget,
+          @RequestParam("maxTripDuration") double maxTripDuration,
+          @RequestParam("userInterests") List<String> userInterests,
+          @RequestParam("userBudget") String userBudget,
+          @RequestParam("startCityName") String startCityName) {
 
-      String cypherQuery = "CREATE (c1:City {name: 'Delhi'}) "
-              + "CREATE (c2:City {name: 'Mumbai'}) "
-              + "CREATE (c3:City {name: 'Kolkata'}) "
-              + "CREATE (c4:City {name: 'Chennai'}) "
-              + "CREATE (c5:City {name: 'Bangalore'}) "
-              + "CREATE (c6:City {name: 'Hyderabad'}) "
-              + "CREATE (c7:City {name: 'Pune'}) "
-              + "CREATE (c8:City {name: 'Jaipur'}) "
-              + "CREATE (c9:City {name: 'Ahmedabad'}) "
-              + "CREATE (c10:City {name: 'Lucknow'}) "
-              + "CREATE (c1)-[:CONNECTS {cost: 3500, travelTime: 2}]->(c2) "
-              + "CREATE (c2)-[:CONNECTS {cost: 4000, travelTime: 2.5}]->(c3) "
-              + "CREATE (c3)-[:CONNECTS {cost: 3000, travelTime: 2}]->(c4) "
-              + "CREATE (c4)-[:CONNECTS {cost: 2500, travelTime: 1.5}]->(c5) "
-              + "CREATE (c5)-[:CONNECTS {cost: 2000, travelTime: 1}]->(c6) "
-              + "CREATE (c6)-[:CONNECTS {cost: 1500, travelTime: 0.75}]->(c7) "
-              + "CREATE (c7)-[:CONNECTS {cost: 1800, travelTime: 1}]->(c8) "
-              + "CREATE (c8)-[:CONNECTS {cost: 2200, travelTime: 1.25}]->(c9) "
-              + "CREATE (c9)-[:CONNECTS {cost: 3200, travelTime: 1.75}]->(c10) "
-              + "CREATE (c10)-[:CONNECTS {cost: 3800, travelTime: 2.25}]->(c1) "
-              + "CREATE (c2)-[:CONNECTS {cost: 4500, travelTime: 3}]->(c4) "
-              + "CREATE (c3)-[:CONNECTS {cost: 3500, travelTime: 2.5}]->(c5) "
-              + "CREATE (c4)-[:CONNECTS {cost: 2800, travelTime: 2}]->(c6) "
-              + "CREATE (c5)-[:CONNECTS {cost: 2400, travelTime: 1.75}]->(c7) "
-              + "CREATE (c6)-[:CONNECTS {cost: 2700, travelTime: 2}]->(c8) "
-              + "CREATE (c7)-[:CONNECTS {cost: 1900, travelTime: 1.25}]->(c9) "
-              + "CREATE (c8)-[:CONNECTS {cost: 2100, travelTime: 1.5}]->(c10) "
-              + "CREATE (c9)-[:CONNECTS {cost: 3400, travelTime: 2}]->(c1) "
-              + "CREATE (c10)-[:CONNECTS {cost: 3600, travelTime: 2.5}]->(c2);";
-      session.run(cypherQuery);
-      System.out.println("Done");
+    String cypherQuery = """
+    WITH $userMaxBudget AS userMaxBudget, 
+         $maxTripDuration AS maxTripDuration, 
+         $userInterests AS userInterests, 
+         $userBudget AS userBudget,
+         $startCityName AS startCityName
+
+    MATCH path = (startCity:City {name: startCityName})-[r:CONNECTED_TO*1..6]->(endCity:City)
+    WITH DISTINCT nodes(path) AS cities, relationships(path) AS connections, userMaxBudget, maxTripDuration, userInterests, userBudget
+
+    UNWIND cities AS city
+    OPTIONAL MATCH (city)-[:HAS_ATTRACTION]->(attraction:Attraction)
+    OPTIONAL MATCH (city)-[:HAS_ACCOMMODATION]->(accommodation:Accommodation)
+    OPTIONAL MATCH (city)-[:HAS_RESTAURANT]->(restaurant:Restaurant)
+    OPTIONAL MATCH (attraction)-[:OFFERS]->(activity:Activity)
+
+    WHERE city.budget_level = userBudget 
+    AND (activity.type IN userInterests OR restaurant.cuisine IN userInterests)
+    AND (accommodation.cost_per_night + attraction.cost + restaurant.average_cost <= userMaxBudget)
+    AND attraction.duration <= maxTripDuration
+
+    WITH cities, connections, city, 
+         collect(DISTINCT attraction.name) AS attractions, 
+         collect(DISTINCT accommodation.name) AS accommodations, 
+         collect(DISTINCT restaurant.name) AS restaurants, 
+         collect(DISTINCT activity.name) AS activities,
+         sum(accommodation.cost_per_night + attraction.cost + restaurant.average_cost) AS cityCost,
+         sum(attraction.duration) AS cityDuration,
+         userMaxBudget, maxTripDuration
+
+    WITH cities, connections, 
+         sum(cityCost) AS totalCityCost, 
+         sum(cityDuration) AS totalCityDuration,
+         collect({
+           cityName: city.name, 
+           attractions: attractions, 
+           accommodations: accommodations, 
+           restaurants: restaurants, 
+           activities: activities
+         }) AS cityDetails,
+         userMaxBudget, maxTripDuration
+
+    WITH cities, connections, cityDetails, 
+         totalCityCost, totalCityDuration,
+         sum(REDUCE(travelCost = 0, r IN connections | travelCost + r.travelCost)) AS totalTravelCost,
+         sum(REDUCE(travelTime = 0, r IN connections | travelTime + r.time)) AS totalTravelTime,
+         userMaxBudget, maxTripDuration
+
+    WITH cities, 
+         totalCityCost + totalTravelCost AS totalTripCost, 
+         totalCityDuration + totalTravelTime AS totalTripDuration,
+         cityDetails, userMaxBudget, maxTripDuration
+
+    WHERE totalTripCost <= userMaxBudget
+    AND totalTripDuration <= maxTripDuration
+
+    RETURN cityDetails AS citiesInPath,
+           totalTripCost AS tripCost,
+           totalTripDuration AS tripDuration
+""";
+
+    try (Session session = driver.session()) {
+      Result result = session.run(cypherQuery, Map.of(
+              "userMaxBudget", userMaxBudget,
+              "maxTripDuration", maxTripDuration,
+              "userInterests", userInterests,
+              "userBudget", userBudget,
+              "startCityName", startCityName
+      ));
+
+      return result.list(record -> {
+        return Map.of(
+                "citiesInPath", record.get("citiesInPath").asList(),
+                "tripCost", record.get("tripCost").asDouble(),
+                "tripDuration", record.get("tripDuration").asDouble()
+        );
+      });
     } catch (Exception e) {
-      System.out.println(e);
-      throw  new Exception();
+      System.out.println("Error executing query: " + e.getMessage());
+      throw new RuntimeException("Failed to retrieve optimal trips", e);
     }
   }
 
-  private HashMap<String,List<String>> populate(List<String> cities) {
-    HashMap<String,List<String>> mp = new HashMap<>();
 
-    for (int i=0; i<cities.size(); i++) {
-      List<String> interests;
+  @GetMapping("/v1/findOptimalTrips")
+  public List<Map<String, Object>> findOptimalTrips(
+          @RequestParam("userMaxBudget") double userMaxBudget,
+          @RequestParam("maxTripDuration") double maxTripDuration,
+          @RequestParam("userInterests") List<String> userInterests,
+          @RequestParam("userBudget") String userBudget) {
 
-      interests = cityRepository.findInterestsByCityName(cities.get(i));
-      mp.put(cities.get(i),interests);
+    String cypherQuery = "WITH $userMaxBudget AS userMaxBudget, " +
+            "$maxTripDuration AS maxTripDuration, " +
+            "$userInterests AS userInterests, " +
+            "$userBudget AS userBudget " +
+
+            "MATCH path = (startCity:City)-[r:CONNECTED_TO*1..6]->(endCity:City) " +
+            "WITH DISTINCT nodes(path) AS cities, relationships(path) AS connections, userMaxBudget, maxTripDuration, userInterests, userBudget " +
+
+            "UNWIND cities AS city " +
+            "OPTIONAL MATCH (city)-[:HAS_ATTRACTION]->(attraction:Attraction) " +
+            "OPTIONAL MATCH (city)-[:HAS_ACCOMMODATION]->(accommodation:Accommodation) " +
+            "OPTIONAL MATCH (city)-[:HAS_RESTAURANT]->(restaurant:Restaurant) " +
+            "OPTIONAL MATCH (attraction)-[:OFFERS]->(activity:Activity) " +
+
+            "WHERE city.budget_level = userBudget " +
+            "AND (activity.type IN userInterests OR restaurant.cuisine IN userInterests) " +
+            "AND (accommodation.cost_per_night + attraction.cost + restaurant.average_cost <= userMaxBudget) " +
+            "AND attraction.duration <= maxTripDuration " +
+
+            "WITH cities, connections, city, " +
+            "collect(DISTINCT attraction.name) AS attractions, " +
+            "collect(DISTINCT accommodation.name) AS accommodations, " +
+            "collect(DISTINCT restaurant.name) AS restaurants, " +
+            "collect(DISTINCT activity.name) AS activities, " +
+            "sum(accommodation.cost_per_night + attraction.cost + restaurant.average_cost) AS cityCost, " +
+            "sum(attraction.duration) AS cityDuration, " +
+            "userMaxBudget, maxTripDuration " +
+
+            "WITH cities, connections, " +
+            "sum(cityCost) AS totalCityCost, " +
+            "sum(cityDuration) AS totalCityDuration, " +
+            "collect({ " +
+            "cityName: city.name, " +
+            "attractions: attractions, " +
+            "accommodations: accommodations, " +
+            "restaurants: restaurants, " +
+            "activities: activities " +
+            "}) AS cityDetails, " +
+            "userMaxBudget, maxTripDuration " +
+
+            "WITH cities, connections, cityDetails, " +
+            "totalCityCost, totalCityDuration, " +
+            "sum(REDUCE(travelCost = 0, r IN connections | travelCost + r.travelCost)) AS totalTravelCost, " +
+            "sum(REDUCE(travelTime = 0, r IN connections | travelTime + r.time)) AS totalTravelTime, " +
+            "userMaxBudget, maxTripDuration " +
+
+            "WITH cities, " +
+            "totalCityCost + totalTravelCost AS totalTripCost, " +
+            "totalCityDuration + totalTravelTime AS totalTripDuration, " +
+            "cityDetails, userMaxBudget, maxTripDuration " +
+
+            "WHERE totalTripCost <= userMaxBudget " +
+            "AND totalTripDuration <= maxTripDuration " +
+
+            "RETURN cityDetails AS citiesInPath, " +
+            "totalTripCost AS tripCost, " +
+            "totalTripDuration AS tripDuration";
+
+
+    try (Session session = driver.session()) {
+      Result result = session.run(cypherQuery, Map.of(
+              "userMaxBudget", userMaxBudget,
+              "maxTripDuration", maxTripDuration,
+              "userInterests", userInterests,
+              "userBudget", userBudget
+      ));
+
+      return result.list(record -> {
+        return Map.of(
+                "citiesInPath", record.get("citiesInPath").asList(),
+                "tripCost", record.get("tripCost").asDouble(),
+                "tripDuration", record.get("tripDuration").asDouble()
+        );
+      });
+    } catch (Exception e) {
+      System.err.println("Error executing query: " + e.getMessage());
+      throw new RuntimeException("Failed to retrieve optimal trips", e);
     }
+  }
 
-    return mp;
+  @GetMapping("*")
+  public String handleUndefinedRoutes() {
+    return "Invalid Route";
   }
 }
